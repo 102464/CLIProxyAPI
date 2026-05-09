@@ -20,6 +20,12 @@ type oaiToResponsesStateReasoning struct {
 	OutputIndex   int
 	ChoiceIndex   int
 }
+
+type responsesFunctionCallTarget struct {
+	Namespace string
+	Name      string
+}
+
 type oaiToResponsesState struct {
 	Seq               int
 	ResponseID        string
@@ -31,23 +37,25 @@ type oaiToResponsesState struct {
 	ReasoningIndex    int
 	// aggregation buffers for response.output
 	// Per-output message text buffers by index
-	MsgTextBuf   map[int]*strings.Builder
-	ReasoningBuf strings.Builder
-	Reasonings   []oaiToResponsesStateReasoning
-	FuncArgsBuf  map[string]*strings.Builder
-	FuncNames    map[string]string
-	FuncCallIDs  map[string]string
-	FuncOutputIx map[string]int
-	MsgOutputIx  map[int]int
-	NextOutputIx int
+	MsgTextBuf     map[int]*strings.Builder
+	ReasoningBuf   strings.Builder
+	Reasonings     []oaiToResponsesStateReasoning
+	FuncArgsBuf    map[string]*strings.Builder
+	FuncNames      map[string]string
+	FuncNamespaces map[string]string
+	FuncCallIDs    map[string]string
+	FuncOutputIx   map[string]int
+	MsgOutputIx    map[int]int
+	NextOutputIx   int
+	ToolTargets    map[string]responsesFunctionCallTarget
 	// message item state per output index
 	MsgItemAdded    map[int]bool // whether response.output_item.added emitted for message
 	MsgContentAdded map[int]bool // whether response.content_part.added emitted for message
 	MsgItemDone     map[int]bool // whether message done events were emitted
 	// function item done state
-	FuncArgsDone map[string]bool
+	FuncArgsDone      map[string]bool
 	MsgTextContentIdx map[int]int
-	FuncItemDone map[string]bool
+	FuncItemDone      map[string]bool
 	// usage aggregation
 	PromptTokens     int64
 	CachedTokens     int64
@@ -62,6 +70,83 @@ var responseIDCounter uint64
 
 func emitRespEvent(event string, payload []byte) []byte {
 	return translatorcommon.SSEEventData(event, payload)
+}
+
+func pickResponsesRequestJSON(originalRequestRawJSON, requestRawJSON []byte) []byte {
+	if len(originalRequestRawJSON) > 0 && gjson.ValidBytes(originalRequestRawJSON) {
+		if request := gjson.GetBytes(originalRequestRawJSON, "request"); request.Exists() && gjson.Valid(request.Raw) {
+			return []byte(request.Raw)
+		}
+		return originalRequestRawJSON
+	}
+	if len(requestRawJSON) > 0 && gjson.ValidBytes(requestRawJSON) {
+		return requestRawJSON
+	}
+	return nil
+}
+
+func responsesFunctionCallTargets(requestRawJSON []byte) map[string]responsesFunctionCallTarget {
+	if len(requestRawJSON) == 0 {
+		return nil
+	}
+
+	tools := gjson.GetBytes(requestRawJSON, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return nil
+	}
+
+	targets := map[string]responsesFunctionCallTarget{}
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		switch strings.TrimSpace(tool.Get("type").String()) {
+		case "", "function":
+			if name := responsesToolName(tool); name != "" {
+				target := responsesFunctionCallTarget{Name: name}
+				targets[name] = target
+				targets[sanitizeResponsesToolName(name)] = target
+			}
+		case "namespace":
+			namespace := strings.TrimSpace(tool.Get("name").String())
+			children := tool.Get("tools")
+			if !children.Exists() || !children.IsArray() {
+				return true
+			}
+			children.ForEach(func(_, child gjson.Result) bool {
+				childName := responsesToolName(child)
+				if childName == "" {
+					return true
+				}
+				qualifiedName := qualifyResponsesNamespaceToolName(namespace, childName)
+				target := responsesFunctionCallTarget{
+					Namespace: namespace,
+					Name:      childName,
+				}
+				targets[qualifiedName] = target
+				targets[sanitizeResponsesToolName(qualifiedName)] = target
+				return true
+			})
+		}
+		return true
+	})
+
+	if len(targets) == 0 {
+		return nil
+	}
+	return targets
+}
+
+func mapResponsesFunctionCallTarget(targets map[string]responsesFunctionCallTarget, name string) responsesFunctionCallTarget {
+	if len(targets) == 0 {
+		return responsesFunctionCallTarget{Name: name}
+	}
+	if target, ok := targets[name]; ok {
+		return target
+	}
+	if sanitizedName := sanitizeResponsesToolName(name); sanitizedName != name {
+		if target, ok := targets[sanitizedName]; ok {
+			return target
+		}
+	}
+	return responsesFunctionCallTarget{Name: name}
 }
 
 func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte, nextSeq func() int) []byte {
@@ -181,6 +266,9 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 			item, _ = sjson.SetBytes(item, "arguments", args)
 			item, _ = sjson.SetBytes(item, "call_id", callID)
 			item, _ = sjson.SetBytes(item, "name", name)
+			if namespace := st.FuncNamespaces[key]; namespace != "" {
+				item, _ = sjson.SetBytes(item, "namespace", namespace)
+			}
 			outputItems = append(outputItems, completedOutputItem{index: st.FuncOutputIx[key], raw: item})
 		}
 	}
@@ -212,22 +300,27 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
 		*param = &oaiToResponsesState{
-			FuncArgsBuf:     make(map[string]*strings.Builder),
-			FuncNames:       make(map[string]string),
-			FuncCallIDs:     make(map[string]string),
-			FuncOutputIx:    make(map[string]int),
-			MsgOutputIx:     make(map[int]int),
-			MsgTextBuf:      make(map[int]*strings.Builder),
-			MsgItemAdded:    make(map[int]bool),
-			MsgContentAdded: make(map[int]bool),
-			MsgItemDone:     make(map[int]bool),
-			FuncArgsDone:    make(map[string]bool),
+			FuncArgsBuf:       make(map[string]*strings.Builder),
+			FuncNames:         make(map[string]string),
+			FuncNamespaces:    make(map[string]string),
+			FuncCallIDs:       make(map[string]string),
+			FuncOutputIx:      make(map[string]int),
+			MsgOutputIx:       make(map[int]int),
+			MsgTextBuf:        make(map[int]*strings.Builder),
+			MsgItemAdded:      make(map[int]bool),
+			MsgContentAdded:   make(map[int]bool),
+			MsgItemDone:       make(map[int]bool),
+			FuncArgsDone:      make(map[string]bool),
 			MsgTextContentIdx: make(map[int]int),
-			FuncItemDone:    make(map[string]bool),
-			Reasonings:      make([]oaiToResponsesStateReasoning, 0),
+			FuncItemDone:      make(map[string]bool),
+			Reasonings:        make([]oaiToResponsesStateReasoning, 0),
+			ToolTargets:       responsesFunctionCallTargets(pickResponsesRequestJSON(originalRequestRawJSON, requestRawJSON)),
 		}
 	}
 	st := (*param).(*oaiToResponsesState)
+	if st.ToolTargets == nil {
+		st.ToolTargets = responsesFunctionCallTargets(pickResponsesRequestJSON(originalRequestRawJSON, requestRawJSON))
+	}
 
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
 		rawJSON = bytes.TrimSpace(rawJSON[5:])
@@ -302,6 +395,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		st.ReasoningIndex = 0
 		st.FuncArgsBuf = make(map[string]*strings.Builder)
 		st.FuncNames = make(map[string]string)
+		st.FuncNamespaces = make(map[string]string)
 		st.FuncCallIDs = make(map[string]string)
 		st.FuncOutputIx = make(map[string]int)
 		st.MsgOutputIx = make(map[int]int)
@@ -515,7 +609,13 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 						newCallID := tc.Get("id").String()
 						nameChunk := tc.Get("function.name").String()
 						if nameChunk != "" {
-							st.FuncNames[key] = nameChunk
+							target := mapResponsesFunctionCallTarget(st.ToolTargets, nameChunk)
+							st.FuncNames[key] = target.Name
+							if target.Namespace != "" {
+								st.FuncNamespaces[key] = target.Namespace
+							} else {
+								delete(st.FuncNamespaces, key)
+							}
 						}
 
 						existingCallID := st.FuncCallIDs[key]
@@ -536,6 +636,9 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 							o, _ = sjson.SetBytes(o, "item.id", fmt.Sprintf("fc_%s", effectiveCallID))
 							o, _ = sjson.SetBytes(o, "item.call_id", effectiveCallID)
 							o, _ = sjson.SetBytes(o, "item.name", st.FuncNames[key])
+							if namespace := st.FuncNamespaces[key]; namespace != "" {
+								o, _ = sjson.SetBytes(o, "item.namespace", namespace)
+							}
 							out = append(out, emitRespEvent("response.output_item.added", o))
 						}
 
@@ -660,6 +763,9 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 						itemDone, _ = sjson.SetBytes(itemDone, "item.arguments", args)
 						itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", callID)
 						itemDone, _ = sjson.SetBytes(itemDone, "item.name", st.FuncNames[key])
+						if namespace := st.FuncNamespaces[key]; namespace != "" {
+							itemDone, _ = sjson.SetBytes(itemDone, "item.namespace", namespace)
+						}
 						out = append(out, emitRespEvent("response.output_item.done", itemDone))
 						st.FuncItemDone[key] = true
 						st.FuncArgsDone[key] = true
@@ -696,10 +802,12 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 		created = time.Now().Unix()
 	}
 	resp, _ = sjson.SetBytes(resp, "created_at", created)
+	reqJSON := pickResponsesRequestJSON(originalRequestRawJSON, requestRawJSON)
+	toolTargets := responsesFunctionCallTargets(reqJSON)
 
 	// Echo request fields when available (aligns with streaming path behavior)
-	if len(requestRawJSON) > 0 {
-		req := gjson.ParseBytes(requestRawJSON)
+	if len(reqJSON) > 0 {
+		req := gjson.ParseBytes(reqJSON)
 		if v := req.Get("instructions"); v.Exists() {
 			resp, _ = sjson.SetBytes(resp, "instructions", v.String())
 		}
@@ -778,8 +886,8 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 	// Detect reasoning_content from upstream Chat Completions response
 	rcText := gjson.GetBytes(rawJSON, "choices.0.message.reasoning_content").String()
 	includeReasoning := rcText != ""
-	if !includeReasoning && len(requestRawJSON) > 0 {
-		includeReasoning = gjson.GetBytes(requestRawJSON, "reasoning").Exists()
+	if !includeReasoning && len(reqJSON) > 0 {
+		includeReasoning = gjson.GetBytes(reqJSON, "reasoning").Exists()
 	}
 	if includeReasoning {
 		rid := id
@@ -819,13 +927,16 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 				if tcs := msg.Get("tool_calls"); tcs.Exists() && tcs.IsArray() {
 					tcs.ForEach(func(_, tc gjson.Result) bool {
 						callID := tc.Get("id").String()
-						name := tc.Get("function.name").String()
+						target := mapResponsesFunctionCallTarget(toolTargets, tc.Get("function.name").String())
 						args := tc.Get("function.arguments").String()
 						item := []byte(`{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`)
 						item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("fc_%s", callID))
 						item, _ = sjson.SetBytes(item, "arguments", args)
 						item, _ = sjson.SetBytes(item, "call_id", callID)
-						item, _ = sjson.SetBytes(item, "name", name)
+						item, _ = sjson.SetBytes(item, "name", target.Name)
+						if target.Namespace != "" {
+							item, _ = sjson.SetBytes(item, "namespace", target.Namespace)
+						}
 						outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
 						return true
 					})

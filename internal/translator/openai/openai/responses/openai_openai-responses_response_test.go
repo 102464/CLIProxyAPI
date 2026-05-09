@@ -219,7 +219,6 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_MultipleToolCalls
 	if doneNames["call_glob"] != "glob" {
 		t.Fatalf("unexpected done name for call_glob: %q", doneNames["call_glob"])
 	}
-
 	if got := gjson.Get(doneArgs["call_read"], "filePath").String(); got != `C:\repo` {
 		t.Fatalf("unexpected filePath for call_read: %q", got)
 	}
@@ -238,6 +237,240 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_MultipleToolCalls
 	}
 	if outputItems["call_glob"].Get("name").String() != "glob" {
 		t.Fatalf("unexpected response.output name for call_glob: %q", outputItems["call_glob"].Get("name").String())
+	}
+}
+
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_RestoresNamespaceToolNames(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{
+		"model":"deepseek-v4-flash",
+		"tools":[
+			{
+				"type":"namespace",
+				"name":"mcp__test_mcp__",
+				"tools":[
+					{
+						"type":"function",
+						"name":"add_numbers",
+						"parameters":{"type":"object","properties":{}}
+					}
+				]
+			}
+		]
+	}`)
+
+	in := []string{
+		`data: {"id":"resp_ns","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_ns","type":"function","function":{"name":"mcp__test_mcp__add_numbers","arguments":""}}]},"finish_reason":null}]}`,
+		`data: {"id":"resp_ns","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":42,\"b\":58}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+	}
+
+	var param any
+	var added gjson.Result
+	var done gjson.Result
+	var completed gjson.Result
+
+	for _, line := range in {
+		for _, chunk := range ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(line), &param) {
+			ev, data := parseOpenAIResponsesSSEEvent(t, chunk)
+			switch ev {
+			case "response.output_item.added":
+				if data.Get("item.type").String() == "function_call" {
+					added = data
+				}
+			case "response.output_item.done":
+				if data.Get("item.type").String() == "function_call" {
+					done = data
+				}
+			case "response.completed":
+				completed = data
+			}
+		}
+	}
+
+	if got := added.Get("item.namespace").String(); got != "mcp__test_mcp__" {
+		t.Fatalf("added item.namespace = %q, want %q", got, "mcp__test_mcp__")
+	}
+	if got := added.Get("item.name").String(); got != "add_numbers" {
+		t.Fatalf("added item.name = %q, want %q", got, "add_numbers")
+	}
+	if got := done.Get("item.namespace").String(); got != "mcp__test_mcp__" {
+		t.Fatalf("done item.namespace = %q, want %q", got, "mcp__test_mcp__")
+	}
+	if got := done.Get("item.name").String(); got != "add_numbers" {
+		t.Fatalf("done item.name = %q, want %q", got, "add_numbers")
+	}
+	if got := completed.Get("response.output.0.namespace").String(); got != "mcp__test_mcp__" {
+		t.Fatalf("completed response.output[0].namespace = %q, want %q", got, "mcp__test_mcp__")
+	}
+	if got := completed.Get("response.output.0.name").String(); got != "add_numbers" {
+		t.Fatalf("completed response.output[0].name = %q, want %q", got, "add_numbers")
+	}
+}
+
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_RestoresNamespaceToolNames(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{
+		"model":"deepseek-v4-flash",
+		"tools":[
+			{
+				"type":"namespace",
+				"name":"mcp__test_mcp__",
+				"tools":[
+					{
+						"type":"function",
+						"name":"add_numbers",
+						"parameters":{"type":"object","properties":{}}
+					}
+				]
+			}
+		]
+	}`)
+
+	raw := []byte(`{
+		"id":"chatcmpl-ns",
+		"object":"chat.completion",
+		"created":1773896263,
+		"model":"deepseek-v4-flash",
+		"choices":[
+			{
+				"index":0,
+				"message":{
+					"role":"assistant",
+					"tool_calls":[
+						{
+							"id":"call_ns",
+							"type":"function",
+							"function":{
+								"name":"mcp__test_mcp__add_numbers",
+								"arguments":"{\"a\":42,\"b\":58}"
+							}
+						}
+					]
+				},
+				"finish_reason":"tool_calls"
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(context.Background(), "model", request, request, raw, nil)
+	result := gjson.ParseBytes(out)
+
+	if got := result.Get("output.0.namespace").String(); got != "mcp__test_mcp__" {
+		t.Fatalf("output[0].namespace = %q, want %q", got, "mcp__test_mcp__")
+	}
+	if got := result.Get("output.0.name").String(); got != "add_numbers" {
+		t.Fatalf("output[0].name = %q, want %q", got, "add_numbers")
+	}
+}
+
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_RestoresSanitizedTopLevelFunctionNames(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{
+		"model":"deepseek-v4-flash",
+		"tools":[
+			{
+				"type":"function",
+				"name":"mcp__redqueen__.redqueen_session_report_assessment",
+				"parameters":{"type":"object","properties":{}}
+			}
+		]
+	}`)
+
+	in := []string{
+		`data: {"id":"resp_top_level","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_report","type":"function","function":{"name":"mcp__redqueen___redqueen_session_report_assessment","arguments":""}}]},"finish_reason":null}]}`,
+		`data: {"id":"resp_top_level","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+	}
+
+	var param any
+	var added gjson.Result
+	var done gjson.Result
+	var completed gjson.Result
+
+	for _, line := range in {
+		for _, chunk := range ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(line), &param) {
+			ev, data := parseOpenAIResponsesSSEEvent(t, chunk)
+			switch ev {
+			case "response.output_item.added":
+				if data.Get("item.type").String() == "function_call" {
+					added = data
+				}
+			case "response.output_item.done":
+				if data.Get("item.type").String() == "function_call" {
+					done = data
+				}
+			case "response.completed":
+				completed = data
+			}
+		}
+	}
+
+	if got := added.Get("item.name").String(); got != "mcp__redqueen__.redqueen_session_report_assessment" {
+		t.Fatalf("added item.name = %q, want %q", got, "mcp__redqueen__.redqueen_session_report_assessment")
+	}
+	if got := done.Get("item.name").String(); got != "mcp__redqueen__.redqueen_session_report_assessment" {
+		t.Fatalf("done item.name = %q, want %q", got, "mcp__redqueen__.redqueen_session_report_assessment")
+	}
+	if got := completed.Get("response.output.0.name").String(); got != "mcp__redqueen__.redqueen_session_report_assessment" {
+		t.Fatalf("completed response.output[0].name = %q, want %q", got, "mcp__redqueen__.redqueen_session_report_assessment")
+	}
+	if completed.Get("response.output.0.namespace").Exists() {
+		t.Fatalf("did not expect namespace for top-level function call: %s", completed.Get("response.output.0").Raw)
+	}
+}
+
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_RestoresSanitizedTopLevelFunctionNames(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{
+		"model":"deepseek-v4-flash",
+		"tools":[
+			{
+				"type":"function",
+				"name":"mcp__redqueen__.redqueen_session_report_assessment",
+				"parameters":{"type":"object","properties":{}}
+			}
+		]
+	}`)
+
+	raw := []byte(`{
+		"id":"chatcmpl-top-level",
+		"object":"chat.completion",
+		"created":1773896263,
+		"model":"deepseek-v4-flash",
+		"choices":[
+			{
+				"index":0,
+				"message":{
+					"role":"assistant",
+					"tool_calls":[
+						{
+							"id":"call_report",
+							"type":"function",
+							"function":{
+								"name":"mcp__redqueen___redqueen_session_report_assessment",
+								"arguments":"{}"
+							}
+						}
+					]
+				},
+				"finish_reason":"tool_calls"
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(context.Background(), "model", request, request, raw, nil)
+	result := gjson.ParseBytes(out)
+
+	if got := result.Get("output.0.name").String(); got != "mcp__redqueen__.redqueen_session_report_assessment" {
+		t.Fatalf("output[0].name = %q, want %q", got, "mcp__redqueen__.redqueen_session_report_assessment")
+	}
+	if result.Get("output.0.namespace").Exists() {
+		t.Fatalf("did not expect namespace for top-level function call: %s", result.Get("output.0").Raw)
 	}
 }
 

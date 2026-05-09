@@ -108,6 +108,17 @@ Response (Responses API) → Client
    - `reasoning: {effort: "..."}` → `reasoning_effort: "..."`
    - `reasoning: null` 或不存在 → `thinking: {type: "disabled"}`
 
+6. **Responses namespace 工具展平**:
+  - `type: "namespace"` 的工具会在转发到 Chat Completions 时展开为顶层 `type: "function"`
+  - 子工具名称按 `mcp__server__tool` 规则保留限定前缀，避免不同 MCP 服务器的同名工具冲突
+  - `tool_choice` 指向 namespace 子工具时，会映射到展开后的限定名
+
+7. **严格函数名兼容层**:
+  - 对 OpenAI/DeepSeek 兼容上游，所有转发出去的 `function.name` 都会收敛到 `[A-Za-z0-9_-]+`
+  - 这一步不仅覆盖 namespace 展平后的工具名，也覆盖原本就是顶层 `type: "function"` 的工具名
+  - 当原始工具名包含 `.`、`/` 等严格模式不接受的字符时，会在 request 方向替换为 `_`
+  - response 方向会基于原始 Responses 请求重建映射，把上游返回的已 sanitize 名称还原成客户端最初看到的工具名/namespace
+
 ### `internal/translator/openai/openai/responses/openai_openai-responses_response.go`
 
 1. **流式 reasoning 处理**:

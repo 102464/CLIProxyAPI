@@ -33,6 +33,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	out := []byte(`{"model":"","messages":[],"stream":false}`)
 
 	root := gjson.ParseBytes(rawJSON)
+	toolNameMap := responsesToolNameMap(root.Get("tools"))
 
 	// Set model name
 	out, _ = sjson.SetBytes(out, "model", modelName)
@@ -87,7 +88,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					toolCall, _ = sjson.SetBytes(toolCall, "id", callId.String())
 				}
 				if name := fc.Get("name"); name.Exists() {
-					toolCall, _ = sjson.SetBytes(toolCall, "function.name", name.String())
+					toolCall, _ = sjson.SetBytes(toolCall, "function.name", mapResponsesToolName(toolNameMap, name.String()))
 				}
 				if arguments := fc.Get("arguments"); arguments.Exists() {
 					toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", arguments.String())
@@ -258,42 +259,42 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	// Convert tools from responses format to chat completions format
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
 		var chatCompletionsTools []interface{}
+		includedToolNames := map[string]struct{}{}
 
 		tools.ForEach(func(_, tool gjson.Result) bool {
-			// Built-in tools (e.g. {"type":"web_search"}) are already compatible with the Chat Completions schema.
-			// Only function tools need structural conversion because Chat Completions nests details under "function".
-			toolType := tool.Get("type").String()
-			if toolType != "" && toolType != "function" && tool.IsObject() {
-				// Almost all providers lack built-in tools, so we just ignore them.
-				// chatCompletionsTools = append(chatCompletionsTools, tool.Value())
-				return true
+			for _, chatTool := range convertResponsesToolToChatCompletionsTools(tool, toolNameMap) {
+				toolName := gjson.GetBytes(chatTool, "function.name").String()
+				if toolName != "" {
+					includedToolNames[toolName] = struct{}{}
+				}
+				chatCompletionsTools = append(chatCompletionsTools, gjson.ParseBytes(chatTool).Value())
 			}
-
-			chatTool := []byte(`{"type":"function","function":{}}`)
-
-			// Convert tool structure from responses format to chat completions format
-			function := []byte(`{"name":"","description":"","parameters":{}}`)
-
-			if name := tool.Get("name"); name.Exists() {
-				function, _ = sjson.SetBytes(function, "name", name.String())
-			}
-
-			if description := tool.Get("description"); description.Exists() {
-				function, _ = sjson.SetBytes(function, "description", description.String())
-			}
-
-			if parameters := tool.Get("parameters"); parameters.Exists() {
-				function, _ = sjson.SetRawBytes(function, "parameters", []byte(parameters.Raw))
-			}
-
-			chatTool, _ = sjson.SetRawBytes(chatTool, "function", function)
-			chatCompletionsTools = append(chatCompletionsTools, gjson.ParseBytes(chatTool).Value())
 
 			return true
 		})
 
 		if len(chatCompletionsTools) > 0 {
 			out, _ = sjson.SetBytes(out, "tools", chatCompletionsTools)
+		}
+
+		if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
+			switch toolChoice.Type {
+			case gjson.String:
+				out, _ = sjson.SetBytes(out, "tool_choice", toolChoice.String())
+			case gjson.JSON:
+				if toolChoice.Get("type").String() == "function" {
+					fn := strings.TrimSpace(toolChoice.Get("function.name").String())
+					if fn == "" {
+						fn = strings.TrimSpace(toolChoice.Get("name").String())
+					}
+					fn = mapResponsesToolName(toolNameMap, fn)
+					if _, ok := includedToolNames[fn]; ok {
+						toolChoiceJSON := []byte(`{"type":"function","function":{"name":""}}`)
+						toolChoiceJSON, _ = sjson.SetBytes(toolChoiceJSON, "function.name", fn)
+						out, _ = sjson.SetRawBytes(out, "tool_choice", toolChoiceJSON)
+					}
+				}
+			}
 		}
 	}
 
@@ -321,10 +322,213 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		out, _ = sjson.SetBytes(out, "thinking", map[string]interface{}{"type": "disabled"})
 	}
 
-	// Convert tool_choice if present
-	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
-		out, _ = sjson.SetBytes(out, "tool_choice", toolChoice.String())
+	// Convert string tool_choice if present and the tools block did not handle it.
+	if !root.Get("tools").Exists() {
+		if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
+			out, _ = sjson.SetBytes(out, "tool_choice", toolChoice.String())
+		}
 	}
 
 	return out
+}
+
+func responsesToolNameMap(tools gjson.Result) map[string]string {
+	if !tools.Exists() || !tools.IsArray() {
+		return nil
+	}
+
+	toolNameMap := map[string]string{}
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		switch strings.TrimSpace(tool.Get("type").String()) {
+		case "", "function":
+			originalName := responsesToolName(tool)
+			if originalName == "" {
+				return true
+			}
+			sanitizedName := sanitizeResponsesToolName(originalName)
+			toolNameMap[originalName] = sanitizedName
+			toolNameMap[sanitizedName] = sanitizedName
+		case "namespace":
+			namespaceName := strings.TrimSpace(tool.Get("name").String())
+			children := tool.Get("tools")
+			if !children.Exists() || !children.IsArray() {
+				return true
+			}
+			children.ForEach(func(_, child gjson.Result) bool {
+				childName := responsesToolName(child)
+				if childName == "" {
+					return true
+				}
+				qualifiedName := qualifyResponsesNamespaceToolName(namespaceName, childName)
+				sanitizedName := sanitizeResponsesToolName(qualifiedName)
+				toolNameMap[qualifiedName] = sanitizedName
+				toolNameMap[sanitizedName] = sanitizedName
+				toolNameMap[childName] = sanitizedName
+				return true
+			})
+		}
+		return true
+	})
+
+	if len(toolNameMap) == 0 {
+		return nil
+	}
+	return toolNameMap
+}
+
+func mapResponsesToolName(toolNameMap map[string]string, name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if mappedName := toolNameMap[name]; mappedName != "" {
+		return mappedName
+	}
+	return sanitizeResponsesToolName(name)
+}
+
+func convertResponsesToolToChatCompletionsTools(tool gjson.Result, toolNameMap map[string]string) [][]byte {
+	toolType := strings.TrimSpace(tool.Get("type").String())
+	switch toolType {
+	case "", "function":
+		if chatTool, ok := convertResponsesFunctionToolToChatCompletions(tool, ""); ok {
+			originalName := responsesToolName(tool)
+			name := gjson.GetBytes(chatTool, "function.name").String()
+			if originalName != "" {
+				toolNameMap[originalName] = name
+			}
+			if name != "" {
+				toolNameMap[name] = name
+			}
+			return [][]byte{chatTool}
+		}
+	case "namespace":
+		return convertResponsesNamespaceToolToChatCompletions(tool, toolNameMap)
+	default:
+		// Almost all providers behind this translator do not support built-in tools,
+		// so we continue ignoring non-function tool types.
+		return nil
+	}
+	return nil
+}
+
+func convertResponsesNamespaceToolToChatCompletions(tool gjson.Result, toolNameMap map[string]string) [][]byte {
+	namespaceName := strings.TrimSpace(tool.Get("name").String())
+	children := tool.Get("tools")
+	if !children.Exists() || !children.IsArray() {
+		return nil
+	}
+
+	var out [][]byte
+	children.ForEach(func(_, child gjson.Result) bool {
+		childName := responsesToolName(child)
+		qualifiedName := qualifyResponsesNamespaceToolName(namespaceName, childName)
+		if chatTool, ok := convertResponsesFunctionToolToChatCompletions(child, qualifiedName); ok {
+			out = append(out, chatTool)
+			sanitizedName := gjson.GetBytes(chatTool, "function.name").String()
+			toolNameMap[qualifiedName] = sanitizedName
+			toolNameMap[sanitizedName] = sanitizedName
+			if childName != "" {
+				toolNameMap[childName] = sanitizedName
+			}
+		}
+		return true
+	})
+	return out
+}
+
+func convertResponsesFunctionToolToChatCompletions(tool gjson.Result, overrideName string) ([]byte, bool) {
+	name := strings.TrimSpace(overrideName)
+	if name == "" {
+		name = responsesToolName(tool)
+	}
+	name = sanitizeResponsesToolName(name)
+	if name == "" {
+		return nil, false
+	}
+
+	chatTool := []byte(`{"type":"function","function":{}}`)
+	function := []byte(`{"name":"","description":"","parameters":{}}`)
+	function, _ = sjson.SetBytes(function, "name", name)
+	if description := responsesToolDescription(tool); description != "" {
+		function, _ = sjson.SetBytes(function, "description", description)
+	}
+	if parameters := responsesToolParameters(tool); parameters.Exists() {
+		function, _ = sjson.SetRawBytes(function, "parameters", []byte(parameters.Raw))
+	}
+	chatTool, _ = sjson.SetRawBytes(chatTool, "function", function)
+	return chatTool, true
+}
+
+func responsesToolName(tool gjson.Result) string {
+	if name := strings.TrimSpace(tool.Get("name").String()); name != "" {
+		return name
+	}
+	return strings.TrimSpace(tool.Get("function.name").String())
+}
+
+func responsesToolDescription(tool gjson.Result) string {
+	if description := strings.TrimSpace(tool.Get("description").String()); description != "" {
+		return description
+	}
+	return strings.TrimSpace(tool.Get("function.description").String())
+}
+
+func responsesToolParameters(tool gjson.Result) gjson.Result {
+	for _, path := range []string{
+		"parameters",
+		"parametersJsonSchema",
+		"input_schema",
+		"function.parameters",
+		"function.parametersJsonSchema",
+	} {
+		if parameters := tool.Get(path); parameters.Exists() {
+			return parameters
+		}
+	}
+	return gjson.Result{}
+}
+
+func qualifyResponsesNamespaceToolName(namespaceName, childName string) string {
+	childName = strings.TrimSpace(childName)
+	if childName == "" || namespaceName == "" || strings.HasPrefix(childName, "mcp__") {
+		return childName
+	}
+	if strings.HasPrefix(childName, namespaceName) {
+		return childName
+	}
+	if strings.HasSuffix(namespaceName, "__") {
+		return namespaceName + childName
+	}
+	return namespaceName + "__" + childName
+}
+
+func sanitizeResponsesToolName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+
+	var builder strings.Builder
+	builder.Grow(len(name))
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+			builder.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			builder.WriteRune(r)
+		case r >= '0' && r <= '9':
+			builder.WriteRune(r)
+		case r == '_' || r == '-':
+			builder.WriteRune(r)
+		default:
+			builder.WriteByte('_')
+		}
+	}
+
+	sanitized := builder.String()
+	if sanitized == "" {
+		return "_"
+	}
+	return sanitized
 }
