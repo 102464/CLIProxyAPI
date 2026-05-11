@@ -50,6 +50,13 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		out, _ = sjson.SetBytes(out, "parallel_tool_calls", parallelToolCalls.Bool())
 	}
 
+	// Preserve explicit provider-specific thinking toggles carried through the
+	// Responses payload so they survive the Responses -> Chat Completions
+	// translation step.
+	if enableThinking := root.Get("enable_thinking"); enableThinking.Exists() {
+		out, _ = sjson.SetBytes(out, "enable_thinking", enableThinking.Value())
+	}
+
 	// Convert instructions to system message
 	if instructions := root.Get("instructions"); instructions.Exists() {
 		systemMessage := []byte(`{"role":"system","content":""}`)
@@ -311,14 +318,15 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	// echo back reasoning_text, so disabling thinking by default is necessary
 	// for reliable operation. Providers that don't support "thinking" (e.g.
 	// OpenAI) will return a 400, which is caught and handled by the retry layer.
+	hasExplicitEnableThinking := root.Get("enable_thinking").Exists()
 	if reasoning := root.Get("reasoning"); reasoning.Exists() {
 		effort := reasoning.Get("effort").String()
 		if effort != "" {
 			out, _ = sjson.SetBytes(out, "reasoning_effort", strings.ToLower(strings.TrimSpace(effort)))
-		} else {
+		} else if !hasExplicitEnableThinking {
 			out, _ = sjson.SetBytes(out, "thinking", map[string]interface{}{"type": "disabled"})
 		}
-	} else {
+	} else if !hasExplicitEnableThinking {
 		out, _ = sjson.SetBytes(out, "thinking", map[string]interface{}{"type": "disabled"})
 	}
 

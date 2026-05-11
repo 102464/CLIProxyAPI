@@ -207,6 +207,31 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_SanitizesStrictFun
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesExplicitEnableThinking(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`{
+		"input": "hello",
+		"enable_thinking": true
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("MiniMax-M2.5", input, false)
+	result := gjson.ParseBytes(out)
+
+	if !result.Get("enable_thinking").Exists() {
+		t.Fatalf("expected enable_thinking to be preserved. Output: %s", string(out))
+	}
+	if got := result.Get("enable_thinking").Bool(); !got {
+		t.Fatalf("enable_thinking = %v, want true. Output: %s", got, string(out))
+	}
+	if result.Get("thinking").Exists() {
+		t.Fatalf("thinking should not be defaulted when enable_thinking is explicit. Output: %s", string(out))
+	}
+	if got := result.Get("messages.0.role").String(); got != "user" {
+		t.Fatalf("messages.0.role = %q, want %q. Output: %s", got, "user", string(out))
+	}
+}
+
 func TestQualifyResponsesNamespaceToolName(t *testing.T) {
 	t.Parallel()
 
