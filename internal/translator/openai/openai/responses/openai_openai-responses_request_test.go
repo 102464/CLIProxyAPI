@@ -232,6 +232,306 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesExplicitE
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_AttachesStandaloneReasoningToToolCallAssistantMessage(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`{
+		"input": [
+			{
+				"type": "reasoning",
+				"summary": [
+					{
+						"type": "summary_text",
+						"text": "Need to inspect the missing dependency first."
+					}
+				]
+			},
+			{
+				"type": "function_call",
+				"call_id": "call_exec",
+				"name": "exec_command",
+				"arguments": "{\"cmd\":\"python3 solve.py\"}"
+			},
+			{
+				"type": "function_call_output",
+				"call_id": "call_exec",
+				"output": "Traceback..."
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4-flash", input, false)
+	result := gjson.ParseBytes(out)
+
+	if got := result.Get("messages.0.role").String(); got != "assistant" {
+		t.Fatalf("messages.0.role = %q, want %q. Output: %s", got, "assistant", string(out))
+	}
+	if got := result.Get("messages.0.reasoning_content").String(); got != "Need to inspect the missing dependency first." {
+		t.Fatalf("messages.0.reasoning_content = %q, want %q. Output: %s", got, "Need to inspect the missing dependency first.", string(out))
+	}
+	if got := result.Get("messages.0.tool_calls.0.function.name").String(); got != "exec_command" {
+		t.Fatalf("messages.0.tool_calls.0.function.name = %q, want %q. Output: %s", got, "exec_command", string(out))
+	}
+	if got := result.Get("messages.1.role").String(); got != "tool" {
+		t.Fatalf("messages.1.role = %q, want %q. Output: %s", got, "tool", string(out))
+	}
+	if got := result.Get("messages.1.tool_call_id").String(); got != "call_exec" {
+		t.Fatalf("messages.1.tool_call_id = %q, want %q. Output: %s", got, "call_exec", string(out))
+	}
+	if result.Get("messages.1.reasoning_content").Exists() {
+		t.Fatalf("tool messages must not carry reasoning_content. Output: %s", string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_AttachesStandaloneReasoningAfterUserMessageToToolCallAssistantMessage(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`{
+		"enable_thinking": true,
+		"input": [
+			{
+				"type": "message",
+				"role": "user",
+				"content": [
+					{
+						"type": "input_text",
+						"text": "Please thinking test"
+					}
+				]
+			},
+			{
+				"type": "reasoning",
+				"summary": [
+					{
+						"type": "summary_text",
+						"text": "Let me check what Python packages are available first."
+					}
+				]
+			},
+			{
+				"type": "function_call",
+				"call_id": "call_00_3iQijZAjxVCVEPJtWt8X0087",
+				"name": "exec_command",
+				"arguments": "{\"cmd\":\"python3 solve.py\"}"
+			},
+			{
+				"type": "function_call_output",
+				"call_id": "call_00_3iQijZAjxVCVEPJtWt8X0087",
+				"output": "ok"
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4-flash", input, false)
+	result := gjson.ParseBytes(out)
+
+	if got := result.Get("messages.0.role").String(); got != "user" {
+		t.Fatalf("messages.0.role = %q, want %q. Output: %s", got, "user", string(out))
+	}
+	if got := result.Get("messages.0.content.0.text").String(); got != "Please thinking test" {
+		t.Fatalf("messages.0.content.0.text = %q, want %q. Output: %s", got, "Please thinking test", string(out))
+	}
+	if got := result.Get("messages.1.role").String(); got != "assistant" {
+		t.Fatalf("messages.1.role = %q, want %q. Output: %s", got, "assistant", string(out))
+	}
+	if got := result.Get("messages.1.reasoning_content").String(); got != "Let me check what Python packages are available first." {
+		t.Fatalf("messages.1.reasoning_content = %q, want %q. Output: %s", got, "Let me check what Python packages are available first.", string(out))
+	}
+	if got := result.Get("messages.1.tool_calls.0.id").String(); got != "call_00_3iQijZAjxVCVEPJtWt8X0087" {
+		t.Fatalf("messages.1.tool_calls.0.id = %q, want %q. Output: %s", got, "call_00_3iQijZAjxVCVEPJtWt8X0087", string(out))
+	}
+	if got := result.Get("messages.1.tool_calls.0.function.name").String(); got != "exec_command" {
+		t.Fatalf("messages.1.tool_calls.0.function.name = %q, want %q. Output: %s", got, "exec_command", string(out))
+	}
+	if got := result.Get("messages.2.role").String(); got != "tool" {
+		t.Fatalf("messages.2.role = %q, want %q. Output: %s", got, "tool", string(out))
+	}
+	if got := result.Get("messages.2.tool_call_id").String(); got != "call_00_3iQijZAjxVCVEPJtWt8X0087" {
+		t.Fatalf("messages.2.tool_call_id = %q, want %q. Output: %s", got, "call_00_3iQijZAjxVCVEPJtWt8X0087", string(out))
+	}
+	if result.Get("messages.2.reasoning_content").Exists() {
+		t.Fatalf("tool messages must not carry reasoning_content. Output: %s", string(out))
+	}
+	if got := result.Get("enable_thinking").Bool(); !got {
+		t.Fatalf("enable_thinking = %v, want true. Output: %s", got, string(out))
+	}
+	if result.Get("thinking").Exists() {
+		t.Fatalf("thinking should not be defaulted when enable_thinking is explicit. Output: %s", string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_MergesAssistantTextWithFollowingToolCall(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`{
+		"enable_thinking": true,
+		"input": [
+			{
+				"type": "reasoning",
+				"summary": [
+					{
+						"type": "summary_text",
+						"text": "Good, I have the challenge context. Let me extract and inspect the attachment."
+					}
+				]
+			},
+			{
+				"type": "message",
+				"role": "assistant",
+				"content": [
+					{
+						"type": "output_text",
+						"text": "Let me extract the zip file and inspect its contents."
+					}
+				]
+			},
+			{
+				"type": "function_call",
+				"call_id": "call_extract",
+				"name": "exec_command",
+				"arguments": "{\"cmd\":\"unzip -l challenge.zip\"}"
+			},
+			{
+				"type": "function_call_output",
+				"call_id": "call_extract",
+				"output": "output.txt\ntask.py"
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4-flash", input, false)
+	result := gjson.ParseBytes(out)
+
+	if got := result.Get("messages.0.role").String(); got != "assistant" {
+		t.Fatalf("messages.0.role = %q, want %q. Output: %s", got, "assistant", string(out))
+	}
+	if got := result.Get("messages.0.reasoning_content").String(); got != "Good, I have the challenge context. Let me extract and inspect the attachment." {
+		t.Fatalf("messages.0.reasoning_content = %q, want %q. Output: %s", got, "Good, I have the challenge context. Let me extract and inspect the attachment.", string(out))
+	}
+	if got := result.Get("messages.0.content.0.text").String(); got != "Let me extract the zip file and inspect its contents." {
+		t.Fatalf("messages.0.content.0.text = %q, want %q. Output: %s", got, "Let me extract the zip file and inspect its contents.", string(out))
+	}
+	if got := result.Get("messages.0.tool_calls.0.id").String(); got != "call_extract" {
+		t.Fatalf("messages.0.tool_calls.0.id = %q, want %q. Output: %s", got, "call_extract", string(out))
+	}
+	if got := result.Get("messages.0.tool_calls.0.function.name").String(); got != "exec_command" {
+		t.Fatalf("messages.0.tool_calls.0.function.name = %q, want %q. Output: %s", got, "exec_command", string(out))
+	}
+	if got := result.Get("messages.1.role").String(); got != "tool" {
+		t.Fatalf("messages.1.role = %q, want %q. Output: %s", got, "tool", string(out))
+	}
+	if result.Get("messages.2").Exists() {
+		t.Fatalf("expected assistant text and tool_call to merge into one assistant message. Output: %s", string(out))
+	}
+	if got := result.Get("enable_thinking").Bool(); !got {
+		t.Fatalf("enable_thinking = %v, want true. Output: %s", got, string(out))
+	}
+	if result.Get("thinking").Exists() {
+		t.Fatalf("thinking should not be defaulted when enable_thinking is explicit. Output: %s", string(out))
+	}
+	if got := result.Get("messages.1.tool_call_id").String(); got != "call_extract" {
+		t.Fatalf("messages.1.tool_call_id = %q, want %q. Output: %s", got, "call_extract", string(out))
+	}
+	if result.Get("messages.1.reasoning_content").Exists() {
+		t.Fatalf("tool messages must not carry reasoning_content. Output: %s", string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_FlushesCompletedToolGroupBeforeNextReasoningTurn(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`{
+		"enable_thinking": true,
+		"input": [
+			{
+				"type": "function_call",
+				"call_id": "call_prev",
+				"name": "previous_tool",
+				"arguments": "{}"
+			},
+			{
+				"type": "function_call_output",
+				"call_id": "call_prev",
+				"output": "ok"
+			},
+			{
+				"type": "message",
+				"role": "user",
+				"content": [
+					{
+						"type": "input_text",
+						"text": "Please thinking test"
+					}
+				]
+			},
+			{
+				"type": "reasoning",
+				"summary": [
+					{
+						"type": "summary_text",
+						"text": "Let me quickly check the attachment before submitting the assessment."
+					}
+				]
+			},
+			{
+				"type": "message",
+				"role": "assistant",
+				"content": [
+					{
+						"type": "output_text",
+						"text": "Let me quickly check the attachment before submitting the assessment."
+					}
+				]
+			},
+			{
+				"type": "function_call",
+				"call_id": "call_next",
+				"name": "exec_command",
+				"arguments": "{\"cmd\":\"cat /workspace/attachments/Power tower.py\"}"
+			},
+			{
+				"type": "function_call_output",
+				"call_id": "call_next",
+				"output": "from Crypto.Util.number import *"
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4-flash", input, false)
+	result := gjson.ParseBytes(out)
+
+	if got := result.Get("messages.0.role").String(); got != "assistant" {
+		t.Fatalf("messages.0.role = %q, want %q. Output: %s", got, "assistant", string(out))
+	}
+	if got := result.Get("messages.0.tool_calls.0.id").String(); got != "call_prev" {
+		t.Fatalf("messages.0.tool_calls.0.id = %q, want %q. Output: %s", got, "call_prev", string(out))
+	}
+	if result.Get("messages.0.reasoning_content").Exists() {
+		t.Fatalf("previous tool-call assistant must not steal next-turn reasoning_content. Output: %s", string(out))
+	}
+	if got := result.Get("messages.1.role").String(); got != "tool" {
+		t.Fatalf("messages.1.role = %q, want %q. Output: %s", got, "tool", string(out))
+	}
+	if got := result.Get("messages.2.role").String(); got != "user" {
+		t.Fatalf("messages.2.role = %q, want %q. Output: %s", got, "user", string(out))
+	}
+	if got := result.Get("messages.3.role").String(); got != "assistant" {
+		t.Fatalf("messages.3.role = %q, want %q. Output: %s", got, "assistant", string(out))
+	}
+	if got := result.Get("messages.3.reasoning_content").String(); got != "Let me quickly check the attachment before submitting the assessment." {
+		t.Fatalf("messages.3.reasoning_content = %q, want %q. Output: %s", got, "Let me quickly check the attachment before submitting the assessment.", string(out))
+	}
+	if got := result.Get("messages.3.content.0.text").String(); got != "Let me quickly check the attachment before submitting the assessment." {
+		t.Fatalf("messages.3.content.0.text = %q, want %q. Output: %s", got, "Let me quickly check the attachment before submitting the assessment.", string(out))
+	}
+	if got := result.Get("messages.3.tool_calls.0.id").String(); got != "call_next" {
+		t.Fatalf("messages.3.tool_calls.0.id = %q, want %q. Output: %s", got, "call_next", string(out))
+	}
+	if got := result.Get("messages.4.role").String(); got != "tool" {
+		t.Fatalf("messages.4.role = %q, want %q. Output: %s", got, "tool", string(out))
+	}
+}
+
 func TestQualifyResponsesNamespaceToolName(t *testing.T) {
 	t.Parallel()
 

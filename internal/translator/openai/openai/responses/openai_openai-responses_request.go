@@ -82,6 +82,62 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		var bufferedMessages []gjson.Result
 		var pendingToolOutputs []gjson.Result
 		var pendingReasoningContent string
+		var pendingAssistantMessage *gjson.Result
+
+		buildChatMessage := func(item gjson.Result, reasoningContent string) []byte {
+			role := item.Get("role").String()
+			if role == "developer" {
+				role = "user"
+			}
+
+			message := []byte(`{"role":"","content":[]}`)
+			message, _ = sjson.SetBytes(message, "role", role)
+
+			if role == "assistant" && reasoningContent != "" {
+				message, _ = sjson.SetBytes(message, "reasoning_content", reasoningContent)
+			}
+
+			if content := item.Get("content"); content.Exists() && content.IsArray() {
+				content.ForEach(func(_, contentItem gjson.Result) bool {
+					contentType := contentItem.Get("type").String()
+					if contentType == "" {
+						contentType = "input_text"
+					}
+					switch contentType {
+					case "input_text", "output_text":
+						text := contentItem.Get("text").String()
+						contentPart := []byte(`{"type":"text","text":""}`)
+						contentPart, _ = sjson.SetBytes(contentPart, "text", text)
+						message, _ = sjson.SetRawBytes(message, "content.-1", contentPart)
+					case "input_image":
+						imageURL := contentItem.Get("image_url").String()
+						contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
+						contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", imageURL)
+						message, _ = sjson.SetRawBytes(message, "content.-1", contentPart)
+					case "reasoning_text":
+						message, _ = sjson.SetBytes(message, "reasoning_content", contentItem.Get("text").String())
+					}
+					return true
+				})
+			} else if content.Type == gjson.String {
+				message, _ = sjson.SetBytes(message, "content", content.String())
+			}
+
+			return message
+		}
+
+		flushPendingAssistantMessage := func() {
+			if pendingAssistantMessage == nil {
+				return
+			}
+
+			message := buildChatMessage(*pendingAssistantMessage, pendingReasoningContent)
+			if pendingReasoningContent != "" {
+				pendingReasoningContent = ""
+			}
+			out, _ = sjson.SetRawBytes(out, "messages.-1", message)
+			pendingAssistantMessage = nil
+		}
 
 		flushToolGroup := func() {
 			if len(pendingFunctionCalls) == 0 && len(pendingToolOutputs) == 0 {
@@ -89,6 +145,17 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			}
 			// 1. Emit one assistant message with all accumulated tool_calls (only if there are function calls to emit)
 			assistantMessage := []byte(`{"role":"assistant","tool_calls":[]}`)
+			if pendingAssistantMessage != nil {
+				assistantMessage = buildChatMessage(*pendingAssistantMessage, pendingReasoningContent)
+				assistantMessage, _ = sjson.SetRawBytes(assistantMessage, "tool_calls", []byte(`[]`))
+				pendingAssistantMessage = nil
+				if pendingReasoningContent != "" {
+					pendingReasoningContent = ""
+				}
+			} else if pendingReasoningContent != "" {
+				assistantMessage, _ = sjson.SetBytes(assistantMessage, "reasoning_content", pendingReasoningContent)
+				pendingReasoningContent = ""
+			}
 			for i, fc := range pendingFunctionCalls {
 				toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 				if callId := fc.Get("call_id"); callId.Exists() {
@@ -119,42 +186,13 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			// 3. Emit any messages that were interleaved between function_call
 			//    and function_call_output (e.g. developer approval messages).
 			for _, msg := range bufferedMessages {
-				role := msg.Get("role").String()
-				if role == "developer" {
-					role = "user"
+				reasoningContent := ""
+				if msg.Get("role").String() == "assistant" {
+					reasoningContent = pendingReasoningContent
 				}
-				message := []byte(`{"role":"","content":[]}`)
-				message, _ = sjson.SetBytes(message, "role", role)
-
-				if role == "assistant" && pendingReasoningContent != "" {
-					message, _ = sjson.SetBytes(message, "reasoning_content", pendingReasoningContent)
+				message := buildChatMessage(msg, reasoningContent)
+				if reasoningContent != "" {
 					pendingReasoningContent = ""
-				}
-
-				if content := msg.Get("content"); content.Exists() && content.IsArray() {
-					content.ForEach(func(_, contentItem gjson.Result) bool {
-						contentType := contentItem.Get("type").String()
-						if contentType == "" {
-							contentType = "input_text"
-						}
-						switch contentType {
-						case "input_text", "output_text":
-							text := contentItem.Get("text").String()
-							contentPart := []byte(`{"type":"text","text":""}`)
-							contentPart, _ = sjson.SetBytes(contentPart, "text", text)
-							message, _ = sjson.SetRawBytes(message, "content.-1", contentPart)
-						case "input_image":
-							imageURL := contentItem.Get("image_url").String()
-							contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
-							contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", imageURL)
-							message, _ = sjson.SetRawBytes(message, "content.-1", contentPart)
-						case "reasoning_text":
-							message, _ = sjson.SetBytes(message, "reasoning_content", contentItem.Get("text").String())
-						}
-						return true
-					})
-				} else if content.Type == gjson.String {
-					message, _ = sjson.SetBytes(message, "content", content.String())
 				}
 
 				out, _ = sjson.SetRawBytes(out, "messages.-1", message)
@@ -164,6 +202,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			pendingFunctionCalls = nil
 			pendingToolOutputs = nil
 			bufferedMessages = nil
+			pendingAssistantMessage = nil
 		}
 
 		input.ForEach(func(_, item gjson.Result) bool {
@@ -174,50 +213,33 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 			switch itemType {
 			case "message", "":
+				if len(pendingToolOutputs) > 0 {
+					// Once we have collected tool outputs, the current tool group is
+					// complete. A subsequent message starts a new turn and must not be
+					// buffered into the previous group, otherwise any following
+					// reasoning item can be attached to the wrong assistant message.
+					flushToolGroup()
+				}
+
+				role := item.Get("role").String()
+				if role == "assistant" && len(pendingFunctionCalls) == 0 && len(pendingToolOutputs) == 0 {
+					flushPendingAssistantMessage()
+					bufferedItem := item
+					pendingAssistantMessage = &bufferedItem
+					break
+				}
+
 				if len(pendingFunctionCalls) > 0 || len(pendingToolOutputs) > 0 {
 					// We're inside an active tool group — buffer this message
 					// so it gets emitted after the tool messages in the correct order.
 					bufferedMessages = append(bufferedMessages, item)
 				} else {
 					// No tool group active, emit directly
-					role := item.Get("role").String()
-					if role == "developer" {
-						role = "user"
-					}
-					message := []byte(`{"role":"","content":[]}`)
-					message, _ = sjson.SetBytes(message, "role", role)
-
+					flushPendingAssistantMessage()
+					message := buildChatMessage(item, pendingReasoningContent)
 					if role == "assistant" && pendingReasoningContent != "" {
-						message, _ = sjson.SetBytes(message, "reasoning_content", pendingReasoningContent)
 						pendingReasoningContent = ""
 					}
-
-					if content := item.Get("content"); content.Exists() && content.IsArray() {
-						content.ForEach(func(_, contentItem gjson.Result) bool {
-							contentType := contentItem.Get("type").String()
-							if contentType == "" {
-								contentType = "input_text"
-							}
-							switch contentType {
-							case "input_text", "output_text":
-								text := contentItem.Get("text").String()
-								contentPart := []byte(`{"type":"text","text":""}`)
-								contentPart, _ = sjson.SetBytes(contentPart, "text", text)
-								message, _ = sjson.SetRawBytes(message, "content.-1", contentPart)
-							case "input_image":
-								imageURL := contentItem.Get("image_url").String()
-								contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
-								contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", imageURL)
-								message, _ = sjson.SetRawBytes(message, "content.-1", contentPart)
-							case "reasoning_text":
-								message, _ = sjson.SetBytes(message, "reasoning_content", contentItem.Get("text").String())
-							}
-							return true
-						})
-					} else if content.Type == gjson.String {
-						message, _ = sjson.SetBytes(message, "content", content.String())
-					}
-
 					out, _ = sjson.SetRawBytes(out, "messages.-1", message)
 				}
 
@@ -236,6 +258,12 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				pendingToolOutputs = append(pendingToolOutputs, item)
 
 			case "reasoning":
+				if len(pendingToolOutputs) > 0 {
+					// A reasoning item after tool outputs belongs to the next
+					// assistant turn, not the completed tool group.
+					flushToolGroup()
+				}
+				flushPendingAssistantMessage()
 				// Extract summary text from standalone reasoning input items.
 				// This text will be injected as reasoning_content on the
 				// subsequent assistant message for models that require echo-back.
@@ -254,8 +282,11 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			return true
 		})
 
-		// Flush any remaining tool group at end of array
-		flushToolGroup()
+		// Flush any remaining buffered assistant message or tool group at end of array.
+		if len(pendingFunctionCalls) > 0 || len(pendingToolOutputs) > 0 {
+			flushToolGroup()
+		}
+		flushPendingAssistantMessage()
 	} else if input.Type == gjson.String {
 		msg := []byte(`{}`)
 		msg, _ = sjson.SetBytes(msg, "role", "user")

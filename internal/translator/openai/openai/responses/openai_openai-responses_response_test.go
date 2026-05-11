@@ -138,6 +138,45 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_ResponseCompleted
 	}
 }
 
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_ReasoningOutputItemDoneIncludesSummaryText(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{"model":"qwen3.6-flash","stream":true}`)
+	in := []string{
+		`data: {"id":"resp_reasoning","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"The hidden chain-of-thought summary"},"finish_reason":null}]}`,
+		`data: {"id":"resp_reasoning","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"content":"final answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`,
+		`data: [DONE]`,
+	}
+
+	var param any
+	var reasoningDone gjson.Result
+
+	for _, line := range in {
+		for _, chunk := range ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(line), &param) {
+			ev, data := parseOpenAIResponsesSSEEvent(t, chunk)
+			if ev != "response.output_item.done" {
+				continue
+			}
+			if data.Get("item.type").String() == "reasoning" {
+				reasoningDone = data
+			}
+		}
+	}
+
+	if !reasoningDone.Exists() {
+		t.Fatal("expected response.output_item.done for reasoning item")
+	}
+	if got := reasoningDone.Get("item.summary.0.text").String(); got != "The hidden chain-of-thought summary" {
+		t.Fatalf("item.summary.0.text = %q, want %q. Event: %s", got, "The hidden chain-of-thought summary", reasoningDone.Raw)
+	}
+	if got := reasoningDone.Get("item.summary.text").String(); got != "" {
+		t.Fatalf("item.summary.text should stay empty because summary is an array. Event: %s", reasoningDone.Raw)
+	}
+	if got := reasoningDone.Get("item.id").String(); got == "" {
+		t.Fatalf("expected reasoning item id to be populated. Event: %s", reasoningDone.Raw)
+	}
+}
+
 func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_MultipleToolCallsRemainSeparate(t *testing.T) {
 	in := []string{
 		`data: {"id":"resp_test","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","content":null,"reasoning_content":null,"tool_calls":[{"index":0,"id":"call_read","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}`,
